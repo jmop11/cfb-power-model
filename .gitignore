@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# .env - to make sure API keys arent tracked when I commit
+.env
+
+# DS_Store - to make sure some random finder folders arent tracked
+.DS_Store
