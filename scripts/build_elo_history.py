@@ -19,7 +19,7 @@ NEWLY_PROMOTED_FBS = {
     2022: ["James Madison"],
     2023: ["Jacksonville State", "Sam Houston"],
     2024: ["Kennesaw State"],
-    2026: ["North Dakota State", "Sacramento State"],
+    2026: ["North Dakota State", "Sacramento State", "Delaware", "Missouri State"],
 }
 
 
