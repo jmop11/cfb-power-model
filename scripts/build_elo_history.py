@@ -10,6 +10,18 @@ MODEL_VERSION = "elo_v2_walkforward_hfa"
 cur.execute("DELETE FROM predictions WHERE model_version = ?", (MODEL_VERSION,))
 conn.commit()
 
+# Teams whose pre-promotion "history" is actually FCS conference play
+# mislabeled as FBS competition, because is_fbs is a static current-day
+# flag rather than year-specific. Defined ONCE here, not inside the loop.
+NEWLY_PROMOTED_FBS = {
+    2017: ["Coastal Carolina"],
+    2018: ["Liberty"],
+    2022: ["James Madison"],
+    2023: ["Jacksonville State", "Sam Houston"],
+    2024: ["Kennesaw State"],
+    2026: ["North Dakota State", "Sacramento State"],
+}
+
 
 def get_config(key, cast=float):
     cur.execute("SELECT value FROM config WHERE key = ?", (key,))
@@ -22,7 +34,7 @@ BLEND_WEIGHT = get_config("preseason_blend_weight")
 ZSCORE_MULTIPLIER = get_config("talent_zscore_to_elo_multiplier")
 REGRESSION_FACTOR = get_config("yearly_regression_factor")
 FCS_BASELINE = get_config("fcs_baseline_rating")
-LEAGUE_BASELINE_HFA = get_config("flat_hfa_placeholder")  # now the starting point every team's residual adjusts
+LEAGUE_BASELINE_HFA = get_config("flat_hfa_placeholder")
 MIN_HOME_GAMES = int(get_config("min_home_games_for_hfa"))
 RESIDUAL_CAP = get_config("hfa_residual_cap")
 DEFAULT_ELO = 1500.0
@@ -34,27 +46,29 @@ cur.execute("SELECT team_id, school FROM teams")
 school_by_id = {row[0]: row[1] for row in cur.fetchall()}
 
 current_rating = {}
-
-# Grows across the whole run. Each entry: (predicted_prob, actual_win),
-# ONLY from non-2020, non-neutral, FBS-vs-FBS home games. This is what
-# gets used to compute each team's residual BEFORE a season starts --
-# never touched by that season's own results, which is what makes this
-# genuinely walk-forward rather than the old single-shot version.
 home_game_history = {}
-
-# Each team's currently-active residual, recomputed once per season
-# boundary and then held fixed for every game that season.
 current_hfa_residual = {}
 
 
 def implied_elo_gap(probability):
-    probability = min(max(probability, 0.02), 0.98)
     import math
+    probability = min(max(probability, 0.02), 0.98)
     return -400 * math.log10((1 / probability) - 1)
 
 
 for season in seasons:
     print(f"=== Processing {season} ===")
+
+    # --- Discard pre-promotion FCS "history" for newly-FBS teams ---
+    for team_name in NEWLY_PROMOTED_FBS.get(season, []):
+        cur.execute("SELECT team_id FROM teams WHERE school = ?", (team_name,))
+        row = cur.fetchone()
+        if row:
+            team_id = row[0]
+            current_rating[team_id] = None
+            home_game_history.pop(team_id, None)
+            current_hfa_residual.pop(team_id, None)
+            print(f"  Reset {team_name}: pre-promotion FCS history discarded")
 
     # --- Recompute each team's HFA residual from history BEFORE this season ---
     for team_id, games in home_game_history.items():
@@ -66,7 +80,7 @@ for season in seasons:
         residual = max(min(residual, RESIDUAL_CAP), -RESIDUAL_CAP)
         current_hfa_residual[team_id] = residual
 
-    # --- Talent z-scores for this season's preseason prior (unchanged) ---
+    # --- Talent z-scores for this season's preseason prior ---
     cur.execute("""
         SELECT team_id, talent_composite FROM team_season
         WHERE season = ? AND talent_composite IS NOT NULL
@@ -97,16 +111,18 @@ for season in seasons:
         )
         current_rating[team_id] = prior
 
+        residual = current_hfa_residual.get(team_id, 0)
+
         cur.execute("SELECT 1 FROM team_season WHERE team_id = ? AND season = ?", (team_id, season))
         if cur.fetchone():
             cur.execute(
-                "UPDATE team_season SET elo_start_of_season = ? WHERE team_id = ? AND season = ?",
-                (prior, team_id, season)
+                "UPDATE team_season SET elo_start_of_season = ?, hfa_residual = ? WHERE team_id = ? AND season = ?",
+                (prior, residual, team_id, season)
             )
         else:
             cur.execute(
-                "INSERT INTO team_season (team_id, season, elo_start_of_season) VALUES (?, ?, ?)",
-                (team_id, season, prior)
+                "INSERT INTO team_season (team_id, season, elo_start_of_season, hfa_residual) VALUES (?, ?, ?, ?)",
+                (team_id, season, prior, residual)
             )
 
     # --- Process this season's games, in TRUE chronological order ---
@@ -130,9 +146,6 @@ for season in seasons:
         rating_home = current_rating.get(home_id) if home_is_fbs else FCS_BASELINE
         rating_away = current_rating.get(away_id) if away_is_fbs else FCS_BASELINE
 
-        # 2020 treated as neutral-field for EVERY game, regardless of team --
-        # crowd restrictions varied unevenly by state/conference, so no
-        # team's home games that year are trustworthy evidence either way.
         if neutral_site or season == 2020:
             hfa = 0
         else:
@@ -145,8 +158,6 @@ for season in seasons:
             VALUES (?, ?, ?, datetime('now'))
         """, (game_id, MODEL_VERSION, predicted_home_prob))
 
-        # Feed this game into FUTURE seasons' residual calc -- never this
-        # season's, since it was already used to generate the prediction above.
         if (not neutral_site and season != 2020 and home_is_fbs and away_is_fbs):
             actual_win = 1 if home_score > away_score else 0
             home_game_history.setdefault(home_id, []).append((predicted_home_prob, actual_win))
