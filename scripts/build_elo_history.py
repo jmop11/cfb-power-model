@@ -5,10 +5,8 @@ db_path = "data/cfb_model.db"
 conn = sqlite3.connect(db_path)
 cur = conn.cursor()
 
-MODEL_VERSION = "elo_v1_flat_hfa"  # labels this run so a later HFA-corrected rerun is never confused with it
+MODEL_VERSION = "elo_v2_walkforward_hfa"
 
-# Safe to rerun: wipe this model version's predictions before rebuilding,
-# rather than letting duplicate rows pile up on every rerun.
 cur.execute("DELETE FROM predictions WHERE model_version = ?", (MODEL_VERSION,))
 conn.commit()
 
@@ -24,17 +22,51 @@ BLEND_WEIGHT = get_config("preseason_blend_weight")
 ZSCORE_MULTIPLIER = get_config("talent_zscore_to_elo_multiplier")
 REGRESSION_FACTOR = get_config("yearly_regression_factor")
 FCS_BASELINE = get_config("fcs_baseline_rating")
-FLAT_HFA = get_config("flat_hfa_placeholder")
+LEAGUE_BASELINE_HFA = get_config("flat_hfa_placeholder")  # now the starting point every team's residual adjusts
+MIN_HOME_GAMES = int(get_config("min_home_games_for_hfa"))
+RESIDUAL_CAP = get_config("hfa_residual_cap")
 DEFAULT_ELO = 1500.0
 
 cur.execute("SELECT DISTINCT season FROM games ORDER BY season")
 seasons = [row[0] for row in cur.fetchall()]
 
+cur.execute("SELECT team_id, school FROM teams")
+school_by_id = {row[0]: row[1] for row in cur.fetchall()}
+
 current_rating = {}
+
+# Grows across the whole run. Each entry: (predicted_prob, actual_win),
+# ONLY from non-2020, non-neutral, FBS-vs-FBS home games. This is what
+# gets used to compute each team's residual BEFORE a season starts --
+# never touched by that season's own results, which is what makes this
+# genuinely walk-forward rather than the old single-shot version.
+home_game_history = {}
+
+# Each team's currently-active residual, recomputed once per season
+# boundary and then held fixed for every game that season.
+current_hfa_residual = {}
+
+
+def implied_elo_gap(probability):
+    probability = min(max(probability, 0.02), 0.98)
+    import math
+    return -400 * math.log10((1 / probability) - 1)
+
 
 for season in seasons:
     print(f"=== Processing {season} ===")
 
+    # --- Recompute each team's HFA residual from history BEFORE this season ---
+    for team_id, games in home_game_history.items():
+        if len(games) < MIN_HOME_GAMES:
+            continue
+        avg_predicted = sum(p for p, _ in games) / len(games)
+        actual_rate = sum(w for _, w in games) / len(games)
+        residual = implied_elo_gap(actual_rate) - implied_elo_gap(avg_predicted)
+        residual = max(min(residual, RESIDUAL_CAP), -RESIDUAL_CAP)
+        current_hfa_residual[team_id] = residual
+
+    # --- Talent z-scores for this season's preseason prior (unchanged) ---
     cur.execute("""
         SELECT team_id, talent_composite FROM team_season
         WHERE season = ? AND talent_composite IS NOT NULL
@@ -77,6 +109,7 @@ for season in seasons:
                 (team_id, season, prior)
             )
 
+    # --- Process this season's games, in TRUE chronological order ---
     cur.execute("""
         SELECT game_id, season_type, week, home_team_id, away_team_id,
                home_score, away_score, neutral_site
@@ -97,18 +130,26 @@ for season in seasons:
         rating_home = current_rating.get(home_id) if home_is_fbs else FCS_BASELINE
         rating_away = current_rating.get(away_id) if away_is_fbs else FCS_BASELINE
 
-        hfa = 0 if neutral_site else FLAT_HFA
+        # 2020 treated as neutral-field for EVERY game, regardless of team --
+        # crowd restrictions varied unevenly by state/conference, so no
+        # team's home games that year are trustworthy evidence either way.
+        if neutral_site or season == 2020:
+            hfa = 0
+        else:
+            hfa = LEAGUE_BASELINE_HFA + current_hfa_residual.get(home_id, 0)
 
-        # NEW: capture the PRE-game predicted probability before ratings change.
-        # This is the piece the original run never saved -- without it, there's
-        # nothing to compare real outcomes against later for HFA calibration
-        # (or eventual Brier scoring).
         predicted_home_prob = calculate_expected_score(rating_home, rating_away, hfa)
 
         cur.execute("""
             INSERT INTO predictions (game_id, model_version, predicted_home_win_prob, generated_at)
             VALUES (?, ?, ?, datetime('now'))
         """, (game_id, MODEL_VERSION, predicted_home_prob))
+
+        # Feed this game into FUTURE seasons' residual calc -- never this
+        # season's, since it was already used to generate the prediction above.
+        if (not neutral_site and season != 2020 and home_is_fbs and away_is_fbs):
+            actual_win = 1 if home_score > away_score else 0
+            home_game_history.setdefault(home_id, []).append((predicted_home_prob, actual_win))
 
         new_home, new_away = update_ratings(
             rating_home, rating_away, home_score, away_score,
@@ -119,9 +160,9 @@ for season in seasons:
             current_rating[home_id] = new_home
             cur.execute("""
                 INSERT OR REPLACE INTO team_week_state
-                (team_id, season, season_type, week, elo_rating)
-                VALUES (?, ?, ?, ?, ?)
-            """, (home_id, season, season_type, week, new_home))
+                (team_id, season, season_type, week, elo_rating, hfa_residual)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (home_id, season, season_type, week, new_home, current_hfa_residual.get(home_id, 0)))
 
         if away_is_fbs:
             current_rating[away_id] = new_away
@@ -132,7 +173,8 @@ for season in seasons:
             """, (away_id, season, season_type, week, new_away))
 
     conn.commit()
-    print(f"{season}: {len(season_games)} games processed")
+    print(f"{season}: {len(season_games)} games processed "
+          f"({len(current_hfa_residual)} teams now have empirical HFA residuals)")
 
 conn.close()
 print("\nDone.")
